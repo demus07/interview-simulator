@@ -1,0 +1,63 @@
+networks:
+  backend:
+    driver: bridge
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    networks:
+      - backend
+    environment:
+      POSTGRES_USER: interview_user
+      POSTGRES_PASSWORD: interview_pass
+      POSTGRES_DB: interview_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U interview_user -d interview_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - backend
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    networks:
+      - backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://interview_user:interview_pass@postgres:5432/interview_db
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      INTERVIEWER_MODEL: ${INTERVIEWER_MODEL:-claude-sonnet-4-6}
+      EVALUATOR_MODEL: ${EVALUATOR_MODEL:-gpt-4o-mini}
+      RECRUITER_MODEL: ${RECRUITER_MODEL:-gpt-4o}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:
