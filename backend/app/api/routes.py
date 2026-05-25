@@ -1,5 +1,5 @@
 """
-Phase 1 REST API — text-only interview loop.
+Phase 1 REST API — voice/text interview loop.
 
 POST /session  → create session, get first question
 POST /answer   → submit answer, get next question (or completion signal)
@@ -14,7 +14,8 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from app.agents.difficulty_manager import update_session_state
@@ -26,7 +27,6 @@ from app.db.database import get_pg_pool, get_redis
 from app.models.types import (
     InterviewMode,
     InterviewPhase,
-    InterviewSession,
     QuestionRecord,
     QuestionType,
     SessionState,
@@ -174,6 +174,60 @@ async def _persist_question_record(session_id: str, qr: QuestionRecord) -> None:
             )
 
 
+# ─── pgvector dedup helpers ───────────────────────────────────────────────────
+
+async def _embed_text(text: str) -> list[float]:
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    resp = await client.embeddings.create(model=settings.embedding_model, input=text)
+    return resp.data[0].embedding
+
+
+async def _store_question_embedding(question_id: str, question_text: str) -> None:
+    """Background task: generate and store a question embedding for future dedup (best-effort)."""
+    try:
+        embedding = await _embed_text(question_text)
+        vec_literal = '[' + ','.join(str(round(x, 8)) for x in embedding) + ']'
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE question_records SET embedding = $1::vector WHERE id = $2",
+                vec_literal,
+                uuid.UUID(question_id),
+            )
+    except Exception:
+        pass  # Dedup is best-effort; never block the session
+
+
+async def _is_duplicate(session_id: str, question_text: str) -> bool:
+    """Return True if the question is too similar to a previously asked one (by embedding cosine similarity)."""
+    try:
+        pool = await get_pg_pool()
+        async with pool.acquire() as conn:
+            has_embeddings = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM question_records WHERE session_id = $1 AND embedding IS NOT NULL)",
+                uuid.UUID(session_id),
+            )
+            if not has_embeddings:
+                return False
+
+            embedding = await _embed_text(question_text)
+            vec_literal = '[' + ','.join(str(round(x, 8)) for x in embedding) + ']'
+            row = await conn.fetchrow(
+                """
+                SELECT 1 - (embedding <=> $1::vector) AS similarity
+                FROM question_records
+                WHERE session_id = $2 AND embedding IS NOT NULL
+                ORDER BY similarity DESC
+                LIMIT 1
+                """,
+                vec_literal,
+                uuid.UUID(session_id),
+            )
+        return bool(row and float(row["similarity"]) > settings.dedup_similarity_threshold)
+    except Exception:
+        return False  # On any failure, let the question through
+
+
 # ─── Request / Response models ────────────────────────────────────────────────
 
 class CreateSessionRequest(BaseModel):
@@ -203,6 +257,8 @@ class SubmitAnswerRequest(BaseModel):
     session_id: str
     transcript: str
     duration_seconds: float = 60.0
+    speech_confidence: float | None = None  # 0.0–1.0 from Web Speech API
+    pause_count: int | None = None          # detected pauses from Web Speech API
 
 
 class SubmitAnswerResponse(BaseModel):
@@ -216,7 +272,10 @@ class SubmitAnswerResponse(BaseModel):
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @router.post("/session", response_model=CreateSessionResponse)
-async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
+async def create_session(
+    req: CreateSessionRequest,
+    background_tasks: BackgroundTasks,
+) -> CreateSessionResponse:
     session_id = str(uuid.uuid4())
     state = SessionState()
 
@@ -265,6 +324,9 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
     # Persist the question row to PostgreSQL now (answer inserted later)
     await _persist_question_record(session_id, qr)
 
+    # Embed the opening question in the background for future dedup checks
+    background_tasks.add_task(_store_question_embedding, qr.id, qr.question_text)
+
     return CreateSessionResponse(
         session_id=session_id,
         question=QuestionResponse(
@@ -280,7 +342,10 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
 
 
 @router.post("/answer", response_model=SubmitAnswerResponse)
-async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
+async def submit_answer(
+    req: SubmitAnswerRequest,
+    background_tasks: BackgroundTasks,
+) -> SubmitAnswerResponse:
     # Load Redis state + session metadata from DB concurrently
     pool = await get_pg_pool()
     state, history, row = await asyncio.gather(
@@ -306,7 +371,13 @@ async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
     target_company = TargetCompany(row["target_company"])
     elapsed = int((datetime.now(timezone.utc) - row["started_at"].replace(tzinfo=timezone.utc)).total_seconds())
 
-    speech_metrics = SpeechMetrics.text_only_default(req.transcript, req.duration_seconds)
+    # Compute speech metrics; prefer real voice API values when provided by the frontend
+    speech_metrics = SpeechMetrics.compute(
+        transcript=req.transcript,
+        duration_seconds=req.duration_seconds,
+        speech_confidence=req.speech_confidence,
+        pause_count=req.pause_count,
+    )
     current_qr.user_answer = UserAnswer(
         transcript=req.transcript,
         duration_seconds=req.duration_seconds,
@@ -327,6 +398,7 @@ async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
     new_state = update_session_state(state, evaluation, elapsed)
     is_complete = new_state.interview_phase == InterviewPhase.CLOSING
     next_question_response: QuestionResponse | None = None
+    new_qr: QuestionRecord | None = None
 
     if not is_complete:
         output = await run_interviewer_agent(
@@ -336,8 +408,23 @@ async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
             target_role=target_role,
             target_company=target_company,
         )
-
         is_complete = output.action.value == "close"
+
+        if not is_complete:
+            # Dedup: retry up to 2× if the generated question is too similar to a previous one
+            for _ in range(2):
+                if not await _is_duplicate(req.session_id, output.question_text):
+                    break
+                output = await run_interviewer_agent(
+                    state=new_state,
+                    last_evaluation=evaluation,
+                    recent_questions=history,
+                    target_role=target_role,
+                    target_company=target_company,
+                )
+                if output.action.value == "close":
+                    is_complete = True
+                    break
 
         if not is_complete:
             if output.action.value == "follow_up":
@@ -362,6 +449,9 @@ async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
             history.append(new_qr)
             await _persist_question_record(req.session_id, new_qr)
 
+            # Store embedding in the background for future dedup checks
+            background_tasks.add_task(_store_question_embedding, new_qr.id, new_qr.question_text)
+
             next_question_response = QuestionResponse(
                 id=new_qr.id,
                 question_text=new_qr.question_text,
@@ -374,15 +464,21 @@ async def submit_answer(req: SubmitAnswerRequest) -> SubmitAnswerResponse:
     # Persist the answered question record
     await _persist_question_record(req.session_id, current_qr)
 
-    # Save updated state and history
-    # Persist only the last 5 questions in Redis (rest live in PostgreSQL)
+    # Save updated state and history (keep last 5 questions in Redis; rest live in PostgreSQL)
     await _save_history(req.session_id, history[-5:])
     await _save_state(req.session_id, new_state)
 
     if is_complete:
-        # Fire Recruiter Agent asynchronously — don't block the response
-        asyncio.create_task(
-            _finalize_session(req.session_id, mode, target_role, target_company, history, new_state, elapsed)
+        # Run Recruiter Agent after the response is sent (via FastAPI BackgroundTasks)
+        background_tasks.add_task(
+            _finalize_session,
+            req.session_id,
+            mode,
+            target_role,
+            target_company,
+            history,
+            new_state,
+            elapsed,
         )
 
     return SubmitAnswerResponse(
@@ -436,7 +532,8 @@ async def get_session(session_id: str) -> dict:
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM interview_sessions WHERE id = $1",
+            # Exclude final_state to avoid leaking evaluator internal notes
+            "SELECT id, user_id, mode, target_role, target_company, started_at, ended_at, duration_seconds FROM interview_sessions WHERE id = $1",
             uuid.UUID(session_id),
         )
     if not row:

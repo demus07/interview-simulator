@@ -79,6 +79,8 @@ export const api = {
     session_id: string
     transcript: string
     duration_seconds: number
+    speech_confidence?: number   // 0.0–1.0 from Web Speech API
+    pause_count?: number         // detected pauses from Web Speech API
   }) => req<SubmitAnswerResponse>('/answer', { method: 'POST', body: JSON.stringify(body) }),
 
   getReport: (session_id: string) =>

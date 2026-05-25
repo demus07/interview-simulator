@@ -91,8 +91,14 @@ class SpeechMetrics(BaseModel):
     confidence_score: float = Field(default=50.0, ge=0, le=100)
 
     @classmethod
-    def text_only_default(cls, transcript: str, duration_seconds: float) -> "SpeechMetrics":
-        """Populate basic metrics from transcript when audio is unavailable."""
+    def compute(
+        cls,
+        transcript: str,
+        duration_seconds: float,
+        speech_confidence: float | None = None,
+        pause_count: int | None = None,
+    ) -> "SpeechMetrics":
+        """Compute speech metrics from transcript text, optionally overriding with real voice API values."""
         words = transcript.split()
         word_count = max(len(words), 1)
         wpm = (word_count / max(duration_seconds, 1)) * 60
@@ -108,23 +114,30 @@ class SpeechMetrics(BaseModel):
         hedge_rate = len(hedges) / word_count
         wpm_score = 1.0 if 120 <= wpm <= 160 else max(0.0, 1 - abs(wpm - 140) / 140)
 
-        confidence = (
+        text_confidence = (
             (1 - filler_rate) * 0.35
             + (1 - hedge_rate) * 0.35
             + wpm_score * 0.30
         ) * 100
 
+        # Real voice API confidence (0–1) takes precedence over text-derived estimate
+        final_confidence = (speech_confidence * 100) if speech_confidence is not None else text_confidence
+
         return cls(
             wpm=round(wpm, 1),
             filler_word_count=len(fillers),
             filler_word_list=fillers,
-            pause_count=0,
+            pause_count=pause_count if pause_count is not None else 0,
             avg_pause_duration_ms=0.0,
             sentence_completion_rate=1.0,
             hedge_word_count=len(hedges),
             technical_term_density=0.0,
-            confidence_score=round(min(100.0, max(0.0, confidence)), 1),
+            confidence_score=round(min(100.0, max(0.0, final_confidence)), 1),
         )
+
+    @classmethod
+    def text_only_default(cls, transcript: str, duration_seconds: float) -> "SpeechMetrics":
+        return cls.compute(transcript, duration_seconds)
 
 
 class AnswerEvaluation(BaseModel):
