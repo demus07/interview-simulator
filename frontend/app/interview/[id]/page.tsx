@@ -9,6 +9,12 @@ import { api, type InterviewPhase, type QuestionData } from '@/lib/api'
 interface TranscriptEntry { question: QuestionData; answer: string }
 type VoiceState = 'idle' | 'recording' | 'reviewing'
 
+// Module-level cache survives React Strict Mode's double-mount.
+// sessionStorage is cleared after first read, so the second invocation
+// reads from here instead of redirecting to /.
+type SessionSeed = { question: QuestionData; phase: InterviewPhase; difficulty_level: number }
+const _seedCache = new Map<string, SessionSeed>()
+
 const PHASE_COLOR: Record<InterviewPhase, string> = {
   warmup:       'text-slate-400 border-slate-600/40 bg-slate-800/40',
   core:         'text-teal-400  border-teal-600/40  bg-teal-900/20',
@@ -104,12 +110,18 @@ export default function InterviewPage() {
     setHasSpeechAPI(!!(window.SpeechRecognition || window.webkitSpeechRecognition))
   }, [])
 
-  // Load first question from sessionStorage
+  // Load first question — checks module cache first (survives React Strict Mode double-mount),
+  // then falls back to sessionStorage (cleared after first read).
   useEffect(() => {
-    const stored = sessionStorage.getItem(`panel:${sessionId}`)
-    if (!stored) { router.push('/'); return }
-    const { question: q, phase: p, difficulty_level: d } = JSON.parse(stored)
-    sessionStorage.removeItem(`panel:${sessionId}`)
+    let seed = _seedCache.get(sessionId)
+    if (!seed) {
+      const raw = sessionStorage.getItem(`panel:${sessionId}`)
+      if (!raw) { router.push('/'); return }
+      seed = JSON.parse(raw) as SessionSeed
+      _seedCache.set(sessionId, seed)
+      sessionStorage.removeItem(`panel:${sessionId}`)
+    }
+    const { question: q, phase: p, difficulty_level: d } = seed
     setQuestion(q)
     setPhase(p)
     setDifficulty(d)
