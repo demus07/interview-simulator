@@ -32,6 +32,7 @@ from app.models.types import (
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
 _openai_client: openai.AsyncOpenAI | None = None
+_ollama_client: openai.AsyncOpenAI | None = None
 
 
 def _get_anthropic() -> anthropic.AsyncAnthropic:
@@ -46,6 +47,13 @@ def _get_openai() -> openai.AsyncOpenAI:
     if _openai_client is None:
         _openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
     return _openai_client
+
+
+def _get_ollama() -> openai.AsyncOpenAI:
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = openai.AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
+    return _ollama_client
 
 
 def _extract_json(text: str) -> str:
@@ -111,6 +119,20 @@ async def _call_openai(prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
+async def _call_ollama(prompt: str, model: str) -> str:
+    client = _get_ollama()
+    response = await client.chat.completions.create(
+        model=model,
+        max_tokens=512,
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": "You are a technical interviewer. You must respond with valid JSON only, no extra text."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
 async def run_interviewer_agent(
     state: SessionState,
     last_evaluation: AnswerEvaluation | None,
@@ -128,11 +150,18 @@ async def run_interviewer_agent(
     )
 
     is_claude = settings.interviewer_model.startswith("claude")
+    is_ollama = settings.interviewer_model.startswith("ollama:")
+    ollama_model = settings.interviewer_model[len("ollama:"):] if is_ollama else ""
     last_err: Exception | None = None
 
     for attempt in range(max_retries + 1):
         try:
-            raw = await (_call_claude(prompt) if is_claude else _call_openai(prompt))
+            if is_claude:
+                raw = await _call_claude(prompt)
+            elif is_ollama:
+                raw = await _call_ollama(prompt, ollama_model)
+            else:
+                raw = await _call_openai(prompt)
             return _parse_output(raw, state)
         except (json.JSONDecodeError, ValidationError, KeyError, ValueError) as exc:
             last_err = exc

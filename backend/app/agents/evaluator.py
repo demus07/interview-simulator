@@ -27,6 +27,7 @@ from app.models.types import (
 
 _openai_client: openai.AsyncOpenAI | None = None
 _anthropic_client: anthropic.AsyncAnthropic | None = None
+_ollama_client: openai.AsyncOpenAI | None = None
 
 
 def _get_openai() -> openai.AsyncOpenAI:
@@ -41,6 +42,13 @@ def _get_anthropic() -> anthropic.AsyncAnthropic:
     if _anthropic_client is None:
         _anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     return _anthropic_client
+
+
+def _get_ollama() -> openai.AsyncOpenAI:
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = openai.AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
+    return _ollama_client
 
 
 def _extract_json(text: str) -> str:
@@ -102,6 +110,20 @@ async def _call_claude(prompt: str) -> str:
     return message.content[0].text
 
 
+async def _call_ollama(prompt: str, model: str) -> str:
+    client = _get_ollama()
+    response = await client.chat.completions.create(
+        model=model,
+        max_tokens=1024,
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": "You are a calibrated technical interview evaluator. You must respond with valid JSON only, no extra text."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content or "{}"
+
+
 def _fallback_evaluation(reason: str) -> AnswerEvaluation:
     """Return a neutral evaluation when the LLM fails repeatedly."""
     na = Score(value=-1, rationale="Evaluation unavailable.")
@@ -139,11 +161,18 @@ async def run_evaluator_agent(
     )
 
     is_claude = settings.evaluator_model.startswith("claude")
+    is_ollama = settings.evaluator_model.startswith("ollama:")
+    ollama_model = settings.evaluator_model[len("ollama:"):] if is_ollama else ""
     last_err: Exception | None = None
 
     for attempt in range(max_retries + 1):
         try:
-            raw = await (_call_claude(prompt) if is_claude else _call_openai(prompt))
+            if is_claude:
+                raw = await _call_claude(prompt)
+            elif is_ollama:
+                raw = await _call_ollama(prompt, ollama_model)
+            else:
+                raw = await _call_openai(prompt)
             evaluation = _parse_evaluation(raw)
             # Validate that the internal note is non-empty (required by spec)
             if not evaluation.interviewer_internal_note.strip():

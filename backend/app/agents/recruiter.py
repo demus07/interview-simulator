@@ -27,6 +27,7 @@ from app.models.types import (
 )
 
 _openai_client: openai.AsyncOpenAI | None = None
+_ollama_client: openai.AsyncOpenAI | None = None
 
 
 def _get_openai() -> openai.AsyncOpenAI:
@@ -34,6 +35,13 @@ def _get_openai() -> openai.AsyncOpenAI:
     if _openai_client is None:
         _openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
     return _openai_client
+
+
+def _get_ollama() -> openai.AsyncOpenAI:
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = openai.AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
+    return _ollama_client
 
 
 def _extract_json(text: str) -> str:
@@ -93,16 +101,18 @@ async def run_recruiter_agent(
         max_difficulty_reached=max_difficulty_reached,
     )
 
-    client = _get_openai()
+    is_ollama = settings.recruiter_model.startswith("ollama:")
+    ollama_model = settings.recruiter_model[len("ollama:"):] if is_ollama else ""
+    client = _get_ollama() if is_ollama else _get_openai()
+    model = ollama_model if is_ollama else settings.recruiter_model
     last_err: Exception | None = None
 
     for attempt in range(max_retries + 1):
         try:
-            response = await client.chat.completions.create(
-                model=settings.recruiter_model,
+            kwargs: dict = dict(
+                model=model,
                 max_tokens=2048,
                 temperature=0.3,
-                response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
@@ -111,6 +121,9 @@ async def run_recruiter_agent(
                     {"role": "user", "content": prompt},
                 ],
             )
+            if not is_ollama:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = await client.chat.completions.create(**kwargs)
             raw = response.choices[0].message.content or "{}"
             return _parse_report(raw)
         except (json.JSONDecodeError, ValidationError, KeyError, ValueError) as exc:

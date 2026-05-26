@@ -47,9 +47,9 @@ services:
       REDIS_URL: redis://redis:6379
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      INTERVIEWER_MODEL: ${INTERVIEWER_MODEL:-claude-sonnet-4-6}
-      EVALUATOR_MODEL: ${EVALUATOR_MODEL:-gpt-4o-mini}
-      RECRUITER_MODEL: ${RECRUITER_MODEL:-gpt-4o}
+      INTERVIEWER_MODEL: ${INTERVIEWER_MODEL:-ollama:gemma2:2b}
+      EVALUATOR_MODEL: ${EVALUATOR_MODEL:-ollama:gemma2:2b}
+      RECRUITER_MODEL: ${RECRUITER_MODEL:-ollama:gemma2:2b}
     depends_on:
       postgres:
         condition: service_healthy

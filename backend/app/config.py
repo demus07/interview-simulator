@@ -12,11 +12,14 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
-    # Model selection (override via env vars to swap providers)
-    interviewer_model: str = "claude-sonnet-4-6"   # or "gpt-4o"
+    # Model selection — prefix "ollama:" to use local Ollama (e.g. "ollama:gemma2:2b")
+    interviewer_model: str = "claude-sonnet-4-6"
     evaluator_model: str = "gpt-4o-mini"
     recruiter_model: str = "gpt-4o"
-    embedding_model: str = "text-embedding-3-small"  # for pgvector dedup
+    embedding_model: str = "text-embedding-3-small"
+
+    # Ollama base URL (reachable from inside Docker via host.docker.internal)
+    ollama_base_url: str = "http://host.docker.internal:11434/v1"
 
     # Session limits
     session_ttl_seconds: int = 7200   # Redis TTL — 2 hours
